@@ -39,7 +39,7 @@ module TinyServer
     end
 
     def shutdown
-      server.shutdown
+      server.shutdown if server
     end
   end
 
@@ -59,31 +59,88 @@ module TinyServer
     def initialize(options = nil)
       @options = options ? DEFAULT_OPTIONS.merge(options) : DEFAULT_OPTIONS
       @creator = caller.first
+      @action_queue = Queue.new
     end
 
-    def start
-      started = Queue.new
+    attr_reader :options
+    attr_reader :creator
+    attr_reader :server
+
+    def start(timeout = 5)
+      raise "Server already started!" if server
+
+      # The listeners are initialized here. We do it outside the thread so an
+      # exception will be thrown if we fail rather than the thread failing.
+      @server = Server.setup(**options, StartCallback: proc { action_queue << :start }, StopCallback: proc { action_queue << :stop }) do
+        run API.instance
+      end
+      @old_handler = trap(:INT, "EXIT")
+
       @server_thread = Thread.new do
-        @server = Server.setup(@options) do
-          run API.instance
-        end
-        @old_handler = trap(:INT, "EXIT")
-        @server.start do
-          started << true
+        begin
+          server.start
+        rescue
+          STDERR.puts "TinyServer failed in `start`: #{$!}"
+          STDERR.puts $!.backtrace
+          queue << $!
         end
       end
-      started.pop
-      trap(:INT, @old_handler)
+      # Wait for the first action (either started or something else)
+      wait_for_action(timeout)
     end
 
-    def stop
-      # yes, this is terrible.
-      @server.shutdown
-      @server_thread.kill
-      @server_thread.join
-      @server_thread = nil
+    def stop(timeout = 5)
+      if old_handler
+        trap(:INT, old_handler)
+        @old_handler = nil
+      end
+
+      if server
+        server.shutdown
+        # Wait for the stop action.
+        wait_for_action(timeout)
+      end
     end
 
+    private
+
+    attr_reader :action_queue
+    attr_reader :server_thread
+    attr_reader :old_handler
+
+    def cleanup(timeout)
+      @server = nil
+      if server_thread
+        # Wait for a normal shutdown first
+        begin
+          server_thread.join(timeout)
+        rescue
+          server_thread.kill
+          server_thread.join(timeout)
+        end
+        @server_thread = nil
+      end
+      @started = nil
+    end
+
+    def wait_for_action(timeout = 5)
+      Timeout.timeout(timeout) do
+        action = action_queue.pop
+        case action
+        when :start
+          @started = true
+        when :stop
+          started = @started
+          cleanup(timeout)
+          raise "Stopped server before it could even start" unless started
+        # Otherwise it's an exception that needs re-raising
+        else
+          cleanup(timeout)
+          raise action
+        end
+        action
+      end
+    end
   end
 
   class API
